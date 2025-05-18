@@ -1,0 +1,65 @@
+# Go specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/vendor/
+/bin/
+go.work
+
+# Project binaries
+/transcription-proxy
+
+# IDE and editor specific
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Temporary and cache directories
+/tmp/
+/temp/
+/cache/
+.cache/
+__pycache__/
+
+# Downloaded models
+/models/
+*.bin
+*.gguf
+*.pt
+
+# Output and log files
+/output/
+/logs/
+*.log
+*.wav
+*.mp3
+*.mp4
+*.srt
+*.vtt
+*.json
+
+# Environment and config files
+.env
+.env.local
+*.env
+config.local.yaml
+config.dev.yaml
+
+# Docker specific
+.dockerignore
+docker-compose.override.yml
+docker-volumes/
+
+# Build artifacts
+/dist/
+/build/

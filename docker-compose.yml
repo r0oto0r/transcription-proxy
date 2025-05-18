@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  transcription-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: transcription-proxy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./transcripts:/app/transcripts
+      - ./models/whisper:/app/models/whisper
+      - ./models/argos:/app/models/argos
+    environment:
+      # Server settings
+      - LISTEN_ADDRESS=:8080
+      - OUTPUT_DIR=/app/transcripts
+      - LOG_LEVEL=info
+      
+      # Whisper model settings
+      - CUDA_ENABLED=true
+      - WHISPER_MODEL_PATH=/app/models/whisper
+      - WHISPER_MODEL_SIZE=large-v3
+      - MAX_VRAM_USAGE_MB=8000
+      - COMPUTE_PRECISION=float16
+      - BATCH_SIZE=16
+      - BEAM_SIZE=5
+      - GPU_THREADS=4
+      
+      # Argos Translate settings
+      - ENABLE_TRANSLATION=true
+      - ARGOS_MODELS_PATH=/app/models/argos
+      - ARGOS_VRAM_USAGE_MB=4000
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
