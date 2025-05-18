@@ -16,8 +16,8 @@ func main() {
 	log.Printf("Starting transcription proxy with configuration:")
 	log.Printf("Listen address: %s", cfg.ListenAddress)
 	log.Printf("CUDA enabled: %v", cfg.CUDAEnabled)
-	log.Printf("Model path: %s", cfg.ModelPath)
-	log.Printf("Model size: %s", cfg.ModelSize)
+	log.Printf("Model path: %s", cfg.WhisperModelPath)
+	log.Printf("Model size: %s", cfg.WhisperModelSize)
 	log.Printf("Output directory: %s", cfg.OutputDir)
 	log.Printf("Log level: %s", cfg.LogLevel)
 
