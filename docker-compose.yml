@@ -31,10 +31,11 @@ services:
       - ARGOS_MODELS_PATH=/app/models/argos
       - ARGOS_VRAM_USAGE_MB=4000
     restart: unless-stopped
+    runtime: nvidia
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
