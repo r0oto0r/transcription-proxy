@@ -45,11 +45,7 @@ RUN pip3 install --no-cache-dir --upgrade pip
 RUN pip3 install --no-cache-dir faster-whisper
 
 # Install Argos Translate and dependencies
-RUN pip3 install --no-cache-dir argostranslate sentencepiece protobuf
-RUN pip3 install --no-cache-dir argospm
-
-# Download optimization tools for GPU performance
-RUN pip3 install --no-cache-dir nvidia-ml-py3 gputil
+RUN pip3 install --no-cache-dir argostranslate
 
 # Set up model directories with proper permissions
 RUN mkdir -p /app/models/whisper /app/models/argos /app/transcripts && \
