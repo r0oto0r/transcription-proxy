@@ -1,20 +1,27 @@
 services:
-  transcription-proxy:
+  # GPU service for systems with NVIDIA GPU
+  transcription-proxy-gpu:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: transcription-proxy
+    container_name: transcription-proxy-gpu
     ports:
-      - "8080:8080"
+      - "1935:1935"  # RTMP input port
+      - "1936:1936"  # Output RTMP port for restreaming
     volumes:
       - ./transcripts:/app/transcripts
       - ./models/whisper:/app/models/whisper
       - ./models/argos:/app/models/argos
     environment:
       # Server settings
-      - LISTEN_ADDRESS=:8080
-      - OUTPUT_DIR=/app/transcripts
       - LOG_LEVEL=info
+      - OUTPUT_DIR=/app/transcripts
+      
+      # RTMP settings
+      - RTMP_PORT=1935
+      - TARGET_URL=rtmp://localhost:1936/out
+      - SRC_LANG=en
+      - LANG=en
       
       # Whisper model settings
       - CUDA_ENABLED=true
@@ -30,7 +37,6 @@ services:
       - ENABLE_TRANSLATION=true
       - ARGOS_MODELS_PATH=/app/models/argos
       - ARGOS_VRAM_USAGE_MB=4000
-    restart: unless-stopped
     runtime: nvidia
     deploy:
       resources:
@@ -39,3 +45,44 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    profiles:
+      - gpu
+
+  # CPU service for systems without NVIDIA GPU
+  transcription-proxy-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    container_name: transcription-proxy-cpu
+    ports:
+      - "1935:1935"  # RTMP input port
+      - "1936:1936"  # Output RTMP port for restreaming
+    volumes:
+      - ./transcripts:/app/transcripts
+      - ./models/whisper:/app/models/whisper
+      - ./models/argos:/app/models/argos
+    environment:
+      # Server settings
+      - LOG_LEVEL=debug
+      - OUTPUT_DIR=/app/transcripts
+      
+      # RTMP settings
+      - RTMP_PORT=1935
+      - TARGET_URL=rtmp://dus01.contribute.live-video.net/app/KEY
+      - SRC_LANG=en
+      - LANG=en
+      
+      # Whisper model settings
+      - CUDA_ENABLED=false
+      - WHISPER_MODEL_PATH=/app/models/whisper
+      - WHISPER_MODEL_SIZE=medium # Using a smaller model for CPU processing
+      - COMPUTE_PRECISION=float32 # float32 works better on CPU
+      - BATCH_SIZE=1
+      - BEAM_SIZE=3
+      - GPU_THREADS=0
+      
+      # Argos Translate settings
+      - ENABLE_TRANSLATION=true
+      - ARGOS_MODELS_PATH=/app/models/argos
+    profiles:
+      - cpu

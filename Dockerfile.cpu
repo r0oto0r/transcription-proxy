@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04 AS build
+FROM ubuntu:22.04 AS build
 
 # Install Go
 RUN apt-get update && apt-get install -y \
@@ -24,7 +24,7 @@ COPY . .
 # Build the application
 RUN go build -o /app/bin/transcription-proxy ./cmd
 
-FROM nvidia/cuda:12.9.0-runtime-ubuntu22.04
+FROM ubuntu:22.04
 
 # Install dependencies for whisper-ctranslate2 and Argos Translate
 RUN apt-get update && apt-get install -y \
@@ -39,11 +39,12 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CUDA optimized PyTorch and dependencies
+# Install PyTorch CPU version and dependencies
 RUN pip3 install --no-cache-dir --upgrade pip
 
-# Install whisper-ctranslate2
-RUN pip3 install --no-cache-dir whisper-ctranslate2
+# Install whisper-ctranslate2 with CPU support
+RUN pip3 install --no-cache-dir "torch>=2.0.0" --extra-index-url https://download.pytorch.org/whl/cpu
+RUN pip3 install --no-cache-dir whisper-ctranslate2 openai-whisper
 
 # Install Argos Translate and dependencies
 RUN pip3 install --no-cache-dir argostranslate

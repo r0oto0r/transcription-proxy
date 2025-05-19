@@ -11,6 +11,12 @@ type Config struct {
 	OutputDir     string
 	LogLevel      string
 
+	// RTMP settings
+	RTMPPort          string
+	DefaultTargetURL  string
+	DefaultSourceLang string
+	DefaultTargetLang string
+
 	// Whisper model settings
 	WhisperModelPath string
 	WhisperModelSize string
@@ -33,6 +39,12 @@ func New() *Config {
 		ListenAddress: getEnvOrDefault("LISTEN_ADDRESS", ":8080"),
 		OutputDir:     getEnvOrDefault("OUTPUT_DIR", "/app/transcripts"),
 		LogLevel:      getEnvOrDefault("LOG_LEVEL", "info"),
+
+		// RTMP settings
+		RTMPPort:          getEnvOrDefault("RTMP_PORT", "1935"),
+		DefaultTargetURL:  getEnvOrDefault("TARGET_URL", "rtmp://localhost:1936/out"),
+		DefaultSourceLang: getEnvOrDefault("SRC_LANG", "en"),
+		DefaultTargetLang: getEnvOrDefault("LANG", "en"),
 
 		// Whisper model settings
 		WhisperModelPath: getEnvOrDefault("WHISPER_MODEL_PATH", "/app/models/whisper"),

@@ -1,10 +1,11 @@
 package translator
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -71,30 +72,59 @@ func (t *Translator) TranslateSegments(segments []transcriber.Segment, sourceLan
 
 // translateText translates a single string from source to target language
 func (t *Translator) translateText(text, sourceLang, targetLang string) (string, error) {
-	// Create temp file for input
-	tempDir, err := os.MkdirTemp("", "argos-translate")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp directory: %w", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	inputPath := filepath.Join(tempDir, "input.txt")
-	if err := os.WriteFile(inputPath, []byte(text), 0644); err != nil {
-		return "", fmt.Errorf("failed to write input text: %w", err)
-	}
-
-	// Set ARGOS_PACKAGES_DIR environment variable
-	cmd := exec.Command("argos-translate", "--from", sourceLang, "--to", targetLang, inputPath)
+	// Create command with pipes
+	cmd := exec.Command("argos-translate", "--from", sourceLang, "--to", targetLang, "-")
 	cmd.Env = append(os.Environ(), fmt.Sprintf("ARGOS_PACKAGES_DIR=%s", t.modelsPath))
 
-	// Run translation
-	output, err := cmd.CombinedOutput()
+	// Create input and output pipes
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return "", fmt.Errorf("translation failed: %w, output: %s", err, string(output))
+		return "", fmt.Errorf("failed to create stdin pipe: %w", err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return "", fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("failed to start argos-translate: %w", err)
+	}
+
+	// Write text to stdin
+	go func() {
+		defer stdin.Close()
+		if _, err := io.WriteString(stdin, text); err != nil {
+			fmt.Fprintf(os.Stderr, "error writing text to argos-translate: %v\n", err)
+		}
+	}()
+
+	// Read output from stdout
+	var output bytes.Buffer
+	if _, err := io.Copy(&output, stdout); err != nil {
+		return "", fmt.Errorf("failed to read translation: %w", err)
+	}
+
+	// Read stderr for error messages
+	var stderrOutput bytes.Buffer
+	if _, err := io.Copy(&stderrOutput, stderr); err != nil {
+		return "", fmt.Errorf("failed to read stderr: %w", err)
+	}
+
+	// Wait for command to complete
+	err = cmd.Wait()
+	if err != nil {
+		return "", fmt.Errorf("translation failed: %w, stderr: %s", err, stderrOutput.String())
 	}
 
 	// Return the translated text
-	return strings.TrimSpace(string(output)), nil
+	return strings.TrimSpace(output.String()), nil
 }
 
 // checkLanguagePair verifies if the language pair is available

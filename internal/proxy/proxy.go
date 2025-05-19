@@ -1,13 +1,15 @@
+// Package proxy provides an RTMP server that uses FFmpeg as a listener.
+// This implementation is designed to handle a single stream at a time,
+// transcribe the audio using Whisper, optionally translate the transcription,
+// embed subtitles into the video, and forward the processed stream to target URLs.
 package proxy
 
 import (
 	"bytes"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -16,18 +18,21 @@ import (
 	"github.com/ben/transcription-proxy/internal/subtitles"
 	"github.com/ben/transcription-proxy/internal/transcriber"
 	"github.com/ben/transcription-proxy/internal/translator"
-	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 )
 
+// Proxy represents an RTMP server that handles incoming streams
 type Proxy struct {
-	config      *config.Config
+	Config      *config.Config `json:"config"`
 	transcriber *transcriber.Transcriber
 	translator  *translator.Translator
 	embedder    *subtitles.SubtitleEmbedder
 	logger      *logrus.Logger
+	ffmpegCmd   *exec.Cmd
+	stopChan    chan struct{}
 }
 
+// New creates a new RTMP server
 func New(cfg *config.Config) *Proxy {
 	logger := logrus.New()
 
@@ -37,285 +42,405 @@ func New(cfg *config.Config) *Proxy {
 	}
 	logger.SetLevel(level)
 
-	return &Proxy{
-		config:      cfg,
+	server := &Proxy{
+		Config:      cfg,
 		transcriber: transcriber.New(cfg),
 		translator:  translator.New(cfg),
 		embedder:    subtitles.New(subtitles.FormatSRT),
 		logger:      logger,
+		stopChan:    make(chan struct{}),
 	}
+
+	return server
 }
 
+// Start starts the RTMP server using FFmpeg as the listener
 func (p *Proxy) Start() error {
-	router := mux.NewRouter()
+	p.logger.WithField("port", p.Config.RTMPPort).Info("Starting FFmpeg-based RTMP server")
 
-	router.HandleFunc("/health", p.handleHealth).Methods("GET")
-	router.HandleFunc("/stream", p.handleStream).Methods("POST")
-
-	p.logger.WithField("address", p.config.ListenAddress).Info("Starting transcription proxy server")
-	return http.ListenAndServe(p.config.ListenAddress, router)
-}
-
-func (p *Proxy) handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, "Transcription proxy server is running")
-}
-
-func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request) {
-	targetURL := r.URL.Query().Get("target")
-	if targetURL == "" {
-		http.Error(w, "Missing target URL", http.StatusBadRequest)
-		return
-	}
-
-	streamTargets, err := parseTargetURLs(targetURL)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Invalid target URL: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	// Source language for transcription
-	sourceLanguage := r.URL.Query().Get("src_lang")
-	if sourceLanguage == "" {
-		sourceLanguage = "en"
-	}
-
-	// Target language for translation - from the 'lang' parameter
-	targetLanguage := r.URL.Query().Get("lang")
-
-	// Subtitle format selection
-	subtitleFormat := r.URL.Query().Get("subtitles")
-	var subtitleType subtitles.SubtitleFormat
-	switch subtitleFormat {
-	case "srt":
-		subtitleType = subtitles.FormatSRT
-	case "vtt":
-		subtitleType = subtitles.FormatVTT
-	case "none":
-		subtitleType = subtitles.FormatNone
-	default:
-		subtitleType = subtitles.FormatSRT
-	}
-
-	p.embedder = subtitles.New(subtitleType)
-
-	requestID := fmt.Sprintf("%d", time.Now().UnixNano())
-	logger := p.logger.WithFields(logrus.Fields{
-		"request_id":    requestID,
-		"targets":       targetURL,
-		"source_lang":   sourceLanguage,
-		"target_lang":   targetLanguage,
-		"subtitle_type": string(subtitleType),
-	})
-
-	logger.Info("Received streaming request")
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		logger.WithError(err).Error("Failed to read request body")
-		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
-		return
-	}
-	defer r.Body.Close()
-
-	// Process the stream in a separate goroutine
-	go func() {
-		if err := p.processStream(body, streamTargets, sourceLanguage, targetLanguage, logger); err != nil {
-			logger.WithError(err).Error("Stream processing failed")
-		} else {
-			logger.Info("Stream processing completed successfully")
-		}
-	}()
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Stream processing started with request ID: %s", requestID)
-}
-
-func (p *Proxy) processStream(data []byte, targets []*streaming.StreamTarget, srcLang, targetLang string, logger *logrus.Entry) error {
-	// Create a temporary directory for processing
-	tempDir, err := os.MkdirTemp("", "proxy-processing")
-	if err != nil {
+	// Create temp directory for FFmpeg temporary files if needed
+	tempDir := fmt.Sprintf("%s/ffmpeg_temp", p.Config.OutputDir)
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
 		return fmt.Errorf("failed to create temp directory: %w", err)
 	}
-	defer os.RemoveAll(tempDir)
 
-	// Write the input data to a file
-	inputPath := filepath.Join(tempDir, "input.mp4")
-	if err := os.WriteFile(inputPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write input data: %w", err)
+	// Create pipes for audio and video
+	audioPipeReader, audioPipeWriter := io.Pipe()
+	videoPipeReader, videoPipeWriter := io.Pipe()
+
+	// Start FFmpeg as an RTMP server
+	args := []string{
+		"-y", // Force overwrite output files
+		"-listen", "1",
+		"-f", "flv",
+		"-i", fmt.Sprintf("rtmp://0.0.0.0:%s/live/stream", p.Config.RTMPPort),
+
+		// Audio output for transcription
+		"-map", "0:a",
+		"-c:a", "pcm_s16le",
+		"-ar", "16000",
+		"-ac", "1",
+		"-f", "wav",
+		"pipe:1", // Output to stdout for audio
+
+		// Video output (preserved for later subtitle embedding)
+		"-map", "0:v",
+		"-c:v", "copy",
+		"-f", "flv", // Using FLV format for video output
+		"pipe:2", // Output to stderr for video
 	}
 
-	// Create channels for the processing pipeline
-	audioCh := make(chan []byte, 1)
-	videoCh := make(chan []byte, 1)
-	resultCh := make(chan []byte, 1)
-	errCh := make(chan error, 3) // For errors from goroutines
+	p.logger.WithField("args", args).Debug("Starting FFmpeg command")
+	cmd := exec.Command("ffmpeg", args...)
 
-	// Split audio and video streams
+	// Set up pipe for FFmpeg's stdout (audio data)
+	cmd.Stdout = audioPipeWriter
+
+	// Set up pipe for FFmpeg's stderr (video data and logs)
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create FFmpeg stderr pipe: %w", err)
+	}
+
+	// Only sending stderr to the video pipe writer, not to os.Stderr to avoid printing error logs
+	// This redirects all FFmpeg error logs away from the terminal
+	videoWriter := videoPipeWriter
+
+	// Start a goroutine to read from stderr pipe and write to the video pipe only
 	go func() {
-		defer close(audioCh)
-		defer close(videoCh)
-
-		if err := p.splitAudioVideo(inputPath, audioCh, videoCh, logger); err != nil {
-			errCh <- fmt.Errorf("audio/video split failed: %w", err)
+		defer videoPipeWriter.Close()
+		if _, err := io.Copy(videoWriter, stderrPipe); err != nil {
+			p.logger.WithError(err).Error("Failed to copy from stderr pipe")
 		}
 	}()
 
-	// Process audio for transcription
-	var wg sync.WaitGroup
-	wg.Add(1)
+	// Start FFmpeg
+	if err := cmd.Start(); err != nil {
+		audioPipeWriter.Close()
+		videoPipeWriter.Close()
+		audioPipeReader.Close()
+		videoPipeReader.Close()
+		return fmt.Errorf("failed to start FFmpeg: %w", err)
+	}
+	p.ffmpegCmd = cmd
 
+	p.logger.Info("FFmpeg RTMP server started successfully")
+
+	// Start processing the pipes in a goroutine
+	go p.processFFmpegOutput(audioPipeReader, videoPipeReader)
+
+	return nil
+}
+
+// Stop stops the RTMP server
+func (p *Proxy) Stop() error {
+	if p.ffmpegCmd != nil && p.ffmpegCmd.Process != nil {
+		close(p.stopChan)
+
+		p.logger.Info("Stopping FFmpeg RTMP server")
+		if err := p.ffmpegCmd.Process.Signal(os.Interrupt); err != nil {
+			p.logger.WithError(err).Warning("Failed to send interrupt to FFmpeg, forcing kill")
+			if err := p.ffmpegCmd.Process.Kill(); err != nil {
+				return fmt.Errorf("failed to kill FFmpeg process: %w", err)
+			}
+		}
+
+		// Wait for process to exit
+		p.ffmpegCmd.Wait()
+		p.logger.Info("FFmpeg RTMP server stopped")
+	}
+	return nil
+}
+
+// processFFmpegOutput handles the audio and video data from FFmpeg pipes
+func (p *Proxy) processFFmpegOutput(audioReader, videoReader io.ReadCloser) {
+	defer audioReader.Close()
+	defer videoReader.Close()
+
+	logger := p.logger.WithFields(logrus.Fields{
+		"processor": "ffmpeg-output",
+	})
+
+	logger.Info("Waiting for incoming RTMP stream")
+
+	// Create a stream connection object
+	streamKey := fmt.Sprintf("stream-%d", time.Now().UnixNano())
+	streamConn := &rtmpConnection{
+		streamName:   streamKey,
+		sourceURL:    fmt.Sprintf("rtmp://localhost:%s/live/stream", p.Config.RTMPPort),
+		targetURL:    p.Config.DefaultTargetURL,
+		sourceLang:   p.Config.DefaultSourceLang,
+		targetLang:   p.Config.DefaultTargetLang,
+		subtitleType: subtitles.FormatSRT,
+	}
+
+	// Parse target URLs once at the beginning
+	streamTargets, err := parseTargetURLs(p.Config.DefaultTargetURL)
+	if err != nil {
+		logger.WithError(err).Error("Invalid target URL")
+		return
+	}
+
+	// Create the streaming client
+	streamer := streaming.New(streamTargets)
+
+	// Create buffers for audio and video
+	const chunkDuration = 10 * time.Second // Process in 10-second chunks
+	const audioSampleRate = 16000          // 16kHz sample rate
+	const bytesPerSample = 2               // 16-bit audio = 2 bytes per sample
+	const channels = 1                     // Mono audio
+
+	// Calculate buffer size for audio (bytes for a chunk duration at given sample rate)
+	audioChunkSize := int(chunkDuration.Seconds() * float64(audioSampleRate) * float64(bytesPerSample) * float64(channels))
+
+	// Buffer for video (will be variable size but need to store it)
+	var videoBuffer bytes.Buffer
+
+	// Buffer for collecting audio chunks
+	audioChunk := make([]byte, audioChunkSize)
+
+	// Track audio bytes read
+	var totalAudioBytesRead int
+
+	// Channel to signal when audio chunk is ready for processing
+	audioChunkReady := make(chan struct{})
+
+	// Create a buffer pool for processed video chunks
+	processedChunks := make(chan []byte, 3) // Buffer up to 3 processed chunks
+
+	// WaitGroup to wait for all goroutines to finish when shutting down
+	var wg sync.WaitGroup
+
+	// Start goroutine to continuously collect video data
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := p.processAudio(audioCh, videoCh, resultCh, srcLang, targetLang, logger); err != nil {
-			errCh <- fmt.Errorf("audio processing failed: %w", err)
-		}
-	}()
 
-	// Stream to targets
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
-
-	streamer := streaming.New(targets)
-	streamErrors := 0
-
-	for {
-		select {
-		case processedData, ok := <-resultCh:
-			if !ok {
-				// Channel closed, all processing complete
-				if streamErrors > 0 {
-					return fmt.Errorf("%d streaming errors occurred", streamErrors)
+		buffer := make([]byte, 64*1024) // 64KB read buffer
+		for {
+			select {
+			case <-p.stopChan:
+				return
+			default:
+				n, err := videoReader.Read(buffer)
+				if err != nil {
+					if err != io.EOF {
+						logger.WithError(err).Error("Error reading video data")
+					}
+					return
 				}
-				return nil
+
+				if n > 0 {
+					videoBuffer.Write(buffer[:n])
+				}
 			}
+		}
+	}()
 
-			if err := streamer.Stream(processedData); err != nil {
-				streamErrors++
-				logger.WithError(err).Error("Error streaming to targets")
+	// Start goroutine to read audio data in chunks
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		for {
+			select {
+			case <-p.stopChan:
+				return
+			default:
+				n, err := audioReader.Read(audioChunk[totalAudioBytesRead:])
+				if err != nil {
+					if err != io.EOF {
+						logger.WithError(err).Error("Error reading audio data")
+					}
+					return
+				}
+
+				if n > 0 {
+					totalAudioBytesRead += n
+
+					// If we've read a full chunk, signal it's ready for processing
+					if totalAudioBytesRead >= audioChunkSize {
+						select {
+						case audioChunkReady <- struct{}{}:
+							// Signal sent
+						case <-p.stopChan:
+							return
+						}
+
+						// Reset counter for next chunk
+						totalAudioBytesRead = 0
+					}
+				}
 			}
-
-		case err := <-errCh:
-			return err
 		}
-	}
-}
+	}()
 
-func (p *Proxy) splitAudioVideo(inputPath string, audioCh, videoCh chan<- []byte, logger *logrus.Entry) error {
-	tempDir := filepath.Dir(inputPath)
+	// Start goroutine to process audio chunks and video data
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 
-	// Extract audio using FFmpeg
-	audioPath := filepath.Join(tempDir, "audio.wav")
-	audioArgs := []string{
-		"-i", inputPath,
-		"-vn",                  // Skip video
-		"-acodec", "pcm_s16le", // Use PCM 16-bit audio codec
-		"-ar", "16000", // Set sample rate to 16kHz
-		"-ac", "1", // Convert to mono
-		"-y", // Overwrite output file
-		audioPath,
-	}
+		var videoChunk []byte
 
-	logger.Info("Extracting audio from input stream")
-	audioCmd := exec.Command("ffmpeg", audioArgs...)
-	audioOutput, err := audioCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to extract audio: %w, output: %s", err, string(audioOutput))
-	}
+		for {
+			select {
+			case <-p.stopChan:
+				return
 
-	// Read the audio file
-	audioData, err := os.ReadFile(audioPath)
-	if err != nil {
-		return fmt.Errorf("failed to read audio file: %w", err)
-	}
-	audioCh <- audioData
+			case <-audioChunkReady:
+				// Copy the current video buffer for this audio chunk
+				videoChunk = make([]byte, videoBuffer.Len())
+				copy(videoChunk, videoBuffer.Bytes())
 
-	// Copy the original video for later processing
-	videoPath := filepath.Join(tempDir, "video.mp4")
-	videoArgs := []string{
-		"-i", inputPath,
-		"-c", "copy", // Copy all streams
-		"-y", // Overwrite output file
-		videoPath,
-	}
+				// Reset video buffer for next chunk
+				videoBuffer.Reset()
 
-	logger.Info("Preparing video for processing")
-	videoCmd := exec.Command("ffmpeg", videoArgs...)
-	videoOutput, err := videoCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to prepare video: %w, output: %s", err, string(videoOutput))
-	}
+				// Process this chunk in a separate goroutine
+				wg.Add(1)
+				go func(audio []byte, video []byte) {
+					defer wg.Done()
 
-	// Read the video file
-	videoData, err := os.ReadFile(videoPath)
-	if err != nil {
-		return fmt.Errorf("failed to read video file: %w", err)
-	}
-	videoCh <- videoData
+					chunkLogger := logger.WithField("chunk_size_bytes", len(audio))
+					chunkLogger.Info("Processing audio/video chunk")
 
-	return nil
-}
+					// If the audio or video chunk is too small, skip processing
+					if len(audio) < 1000 || len(video) < 1000 {
+						chunkLogger.Warn("Chunk too small, skipping processing")
+						// Still forward the video for continuity
+						select {
+						case processedChunks <- video:
+							// Chunk queued for streaming
+						case <-p.stopChan:
+							return
+						}
+						return
+					}
 
-func (p *Proxy) processAudio(audioCh <-chan []byte, videoCh <-chan []byte, resultCh chan<- []byte, srcLang, targetLang string, logger *logrus.Entry) error {
-	var audioData []byte
-	for chunk := range audioCh {
-		audioData = append(audioData, chunk...)
-	}
+					// Transcribe the audio chunk with retries
+					var segments []transcriber.Segment
+					var err error
+					maxRetries := 3
 
-	var videoData []byte
-	for chunk := range videoCh {
-		videoData = append(videoData, chunk...)
-	}
+					for i := 0; i < maxRetries; i++ {
+						segments, err = p.transcriber.TranscribeAudio(audio, streamConn.sourceLang)
+						if err == nil {
+							break
+						}
 
-	// Process transcription
-	startTime := time.Now()
-	logger.Info("Starting transcription")
+						chunkLogger.WithError(err).Warnf("Transcription attempt %d failed, retrying...", i+1)
+						time.Sleep(100 * time.Millisecond) // Small delay between retries
+					}
 
-	segments, err := p.transcriber.TranscribeAudio(audioData, srcLang)
-	if err != nil {
-		logger.WithError(err).Error("Transcription failed")
-		// If transcription fails, forward the original video
-		resultCh <- videoData
-		return err
-	}
+					if err != nil {
+						chunkLogger.WithError(err).Error("Chunk transcription failed after retries")
+						// Forward original video chunk if transcription fails
+						select {
+						case processedChunks <- video:
+							// Chunk queued for streaming
+						case <-p.stopChan:
+							return
+						}
+						return
+					}
 
-	logger.WithField("duration", time.Since(startTime)).WithField("segments", len(segments)).Info("Transcription completed")
+					// Translate if needed
+					if streamConn.targetLang != "" && streamConn.targetLang != streamConn.sourceLang {
+						translatedSegments, err := p.translator.TranslateSegments(segments, streamConn.sourceLang, streamConn.targetLang)
+						if err != nil {
+							chunkLogger.WithError(err).Error("Translation failed, using original transcription")
+						} else {
+							segments = translatedSegments
+						}
+					}
 
-	// Translate if target language is specified
-	if targetLang != "" && targetLang != srcLang {
-		logger.WithFields(logrus.Fields{
-			"source": srcLang,
-			"target": targetLang,
-		}).Info("Starting translation with Argos Translate")
+					// Embed subtitles into video chunk with retries
+					var processedVideo []byte
+					for i := 0; i < maxRetries; i++ {
+						processedVideo, err = p.embedder.EmbedSubtitles(video, segments)
+						if err == nil {
+							break
+						}
 
-		translationStart := time.Now()
-		translatedSegments, err := p.translator.TranslateSegments(segments, srcLang, targetLang)
-		if err != nil {
-			logger.WithError(err).Error("Translation failed, using original transcription")
-		} else {
-			segments = translatedSegments
-			logger.WithField("duration", time.Since(translationStart)).
-				Info("Translation completed")
+						chunkLogger.WithError(err).Warnf("Subtitle embedding attempt %d failed, retrying...", i+1)
+						time.Sleep(100 * time.Millisecond) // Small delay between retries
+					}
+
+					if err != nil {
+						chunkLogger.WithError(err).Error("Failed to embed subtitles after retries, using original video")
+						select {
+						case processedChunks <- video:
+							// Chunk queued for streaming
+						case <-p.stopChan:
+							return
+						}
+						return
+					}
+
+					// Queue the processed chunk for streaming
+					select {
+					case processedChunks <- processedVideo:
+						chunkLogger.Info("Chunk processed and queued for streaming")
+					case <-p.stopChan:
+						return
+					}
+				}(append([]byte{}, audioChunk[:audioChunkSize]...), videoChunk)
+			}
 		}
-	}
+	}()
 
-	// Embed subtitles
-	logger.Info("Embedding subtitles into video stream")
-	processedVideo, err := p.embedder.EmbedSubtitles(videoData, segments)
-	if err != nil {
-		logger.WithError(err).Error("Failed to embed subtitles, using original video")
-		resultCh <- videoData
-		return err
-	}
+	// Start goroutine to stream processed chunks
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 
-	resultCh <- processedVideo
-	logger.Info("Video processing completed")
+		for {
+			select {
+			case <-p.stopChan:
+				return
 
-	return nil
+			case chunk := <-processedChunks:
+				chunkLogger := logger.WithField("chunk_size", len(chunk))
+				chunkLogger.Info("Streaming processed chunk")
+
+				// Try multiple times to stream the chunk
+				var err error
+				maxRetries := 3
+
+				for i := 0; i < maxRetries; i++ {
+					err = streamer.Stream(chunk)
+					if err == nil {
+						break
+					}
+
+					chunkLogger.WithError(err).Warnf("Streaming attempt %d failed, retrying...", i+1)
+					time.Sleep(100 * time.Millisecond) // Small delay between retries
+				}
+
+				if err != nil {
+					chunkLogger.WithError(err).Error("Error streaming chunk after retries")
+				}
+			}
+		}
+	}()
+
+	// Wait for all goroutines to complete when stop is called
+	<-p.stopChan
+	logger.Info("Stopping all stream processing goroutines")
+	wg.Wait()
+	logger.Info("Stream processing stopped")
 }
 
+// rtmpConnection represents an active RTMP connection
+type rtmpConnection struct {
+	streamName   string
+	sourceURL    string
+	targetURL    string
+	sourceLang   string
+	targetLang   string
+	subtitleType subtitles.SubtitleFormat
+}
+
+// parseTargetURLs parses a comma-separated list of target URLs
 func parseTargetURLs(targetURLs string) ([]*streaming.StreamTarget, error) {
 	urls := bytes.Split([]byte(targetURLs), []byte(","))
 	targets := make([]*streaming.StreamTarget, 0, len(urls))

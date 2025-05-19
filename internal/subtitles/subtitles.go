@@ -3,9 +3,9 @@ package subtitles
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"time"
 
 	"github.com/ben/transcription-proxy/internal/transcriber"
@@ -75,65 +75,106 @@ func (e *SubtitleEmbedder) generateSubtitleData(segments []transcriber.Segment) 
 }
 
 func (e *SubtitleEmbedder) embedSubtitleDataIntoVideo(videoData, subtitleData []byte) ([]byte, error) {
-	// Create temporary directory for processing
-	tempDir, err := os.MkdirTemp("", "subtitle-embedding")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp directory: %w", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	// Write video data to temp file
-	videoPath := filepath.Join(tempDir, "input.mp4")
-	if err := os.WriteFile(videoPath, videoData, 0644); err != nil {
-		return nil, fmt.Errorf("failed to write video to temp file: %w", err)
-	}
-
-	// Write subtitle data to temp file
-	var subtitleExt string
-	switch e.format {
-	case FormatSRT:
-		subtitleExt = "srt"
-	case FormatVTT:
-		subtitleExt = "vtt"
-	default:
-		return nil, fmt.Errorf("unsupported subtitle format: %s", e.format)
-	}
-
-	subtitlePath := filepath.Join(tempDir, fmt.Sprintf("subtitles.%s", subtitleExt))
-	if err := os.WriteFile(subtitlePath, subtitleData, 0644); err != nil {
-		return nil, fmt.Errorf("failed to write subtitles to temp file: %w", err)
-	}
-
-	// Output path for processed video
-	outputPath := filepath.Join(tempDir, "output.mp4")
-
-	// Use FFmpeg to embed subtitles
+	// Setup FFmpeg command with input pipes
 	args := []string{
-		"-i", videoPath,
-		"-i", subtitlePath,
+		"-loglevel", "warning", // Reduce log noise
+		"-i", "pipe:0", // Read video from stdin without specifying format
+		"-f", subtitleFormatToFFmpegFormat(e.format), // Specify subtitle format
+		"-i", "pipe:3", // Read subtitles from file descriptor 3
 		"-c:v", "copy", // Copy video codec
 		"-c:a", "copy", // Copy audio codec
 		"-c:s", "mov_text", // Use mov_text codec for subtitles
 		"-metadata:s:s:0", "language=eng", // Set subtitle language to English
-		"-y", // Overwrite output file if it exists
-		outputPath,
+		"-y",        // Overwrite output file if it exists
+		"-f", "flv", // Specify FLV output format (better for streaming)
+		"pipe:1", // Output to stdout
 	}
 
 	cmd := exec.Command("ffmpeg", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("ffmpeg failed: %w, stderr: %s", err, stderr.String())
+	// Setup the stdin pipe for video data
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
 
-	// Read the processed video
-	processedVideo, err := os.ReadFile(outputPath)
+	// Setup stdout pipe to capture the processed video
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	// Setup stderr pipe to capture any error messages
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
+	// Create a pipe for subtitle data
+	subtitleRead, subtitleWrite, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create subtitle pipe: %w", err)
+	}
+	defer subtitleRead.Close()
+	defer subtitleWrite.Close()
+
+	// Assign the read end of the pipe to the extra file descriptor
+	cmd.ExtraFiles = []*os.File{subtitleRead}
+
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start ffmpeg: %w", err)
+	}
+
+	// Write video data to stdin in a goroutine
+	go func() {
+		defer stdin.Close()
+		if _, err := stdin.Write(videoData); err != nil {
+			// Don't print to stderr, just silently handle the error
+			_ = err
+		}
+	}()
+
+	// Write subtitle data to the subtitle pipe in a goroutine
+	go func() {
+		defer subtitleWrite.Close()
+		if _, err := subtitleWrite.Write(subtitleData); err != nil {
+			// Don't print to stderr, just silently handle the error
+			_ = err
+		}
+	}()
+
+	// Read processed video from stdout
+	var output bytes.Buffer
+	if _, err := io.Copy(&output, stdout); err != nil {
 		return nil, fmt.Errorf("failed to read processed video: %w", err)
 	}
 
-	return processedVideo, nil
+	// Read stderr for error messages
+	var stderrOutput bytes.Buffer
+	if _, err := io.Copy(&stderrOutput, stderr); err != nil {
+		return nil, fmt.Errorf("failed to read stderr: %w", err)
+	}
+
+	// Wait for the command to complete
+	err = cmd.Wait()
+	if err != nil {
+		return nil, fmt.Errorf("ffmpeg failed: %w, stderr: %s", err, stderrOutput.String())
+	}
+
+	return output.Bytes(), nil
+}
+
+// Helper function to convert subtitle format to FFmpeg format
+func subtitleFormatToFFmpegFormat(format SubtitleFormat) string {
+	switch format {
+	case FormatSRT:
+		return "srt"
+	case FormatVTT:
+		return "webvtt"
+	default:
+		return "srt"
+	}
 }
 
 func formatSRTTime(seconds float64) string {
